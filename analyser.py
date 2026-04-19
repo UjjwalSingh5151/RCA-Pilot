@@ -62,18 +62,29 @@ def scan_variance(filepath, threshold_pct=5.0):
     return results, flagged, seasonality
 
 # --- Part 2: Hypothesis checker ---
-def check_hypotheses(filepath, metric, hypotheses):
+def check_hypotheses(filepath, metric, hypotheses, variance_stats=None, all_flagged=None):
     """
     Takes a flagged metric + list of hypotheses.
     Returns LLM verdict for each hypothesis: supported / contradicted / inconclusive.
+
+    variance_stats: dict from scan_variance for this metric (variance_pct, wow_pct, etc.)
+    all_flagged: full list of flagged metric dicts for cross-metric context
     """
     actuals = pd.read_excel(filepath, sheet_name="actuals")
     forecast = pd.read_excel(filepath, sheet_name="forecast")
     seasonality = pd.read_excel(filepath, sheet_name="seasonality")
 
-    # Get last 7 days for context
-    actuals_week = actuals.tail(7)[["date", metric]].to_string(index=False)
+    # Improvement 2: 4 weeks of actuals for trend context instead of 7 days
+    actuals_4w = actuals.tail(28)[["date", metric]].to_string(index=False)
     forecast_week = forecast.tail(7)[["date", metric]].to_string(index=False)
+
+    # Improvement 2: Statistical grounding — 4-week mean, std dev, z-score
+    series_4w = actuals.tail(28)[metric]
+    mean_4w = series_4w.mean()
+    std_4w = series_4w.std()
+    current_week_avg = actuals.tail(7)[metric].mean()
+    z_score = (current_week_avg - mean_4w) / std_4w if std_4w > 0 else 0
+    pct_vs_4w_mean = ((current_week_avg - mean_4w) / mean_4w * 100) if mean_4w != 0 else 0
 
     # Get seasonality rows for this metric if they exist
     season_data = seasonality[seasonality["metric"] == metric]
@@ -81,18 +92,49 @@ def check_hypotheses(filepath, metric, hypotheses):
 
     hypotheses_text = "\n".join([f"{i+1}. {h}" for i, h in enumerate(hypotheses)])
 
+    # Improvement 1: Include pre-computed variance stats from scan_variance
+    stats_block = ""
+    if variance_stats:
+        stats_block = f"""
+PRE-COMPUTED VARIANCE STATS:
+- Variance vs forecast (this week): {variance_stats['variance_pct']:+.2f}%
+- Week-over-week change: {variance_stats['wow_pct']:+.2f}%
+- This week avg: {variance_stats['actual_avg']}  |  Forecast avg: {variance_stats['forecast_avg']}
+"""
+
+    # Improvement 3: Cross-metric context from other flagged metrics
+    cross_metric_block = ""
+    if all_flagged:
+        other_flagged = [f for f in all_flagged if f["metric"] != metric]
+        if other_flagged:
+            lines = []
+            for f in other_flagged:
+                lines.append(
+                    f"  {f['metric']}: variance {f['variance_pct']:+.2f}% vs forecast, "
+                    f"WoW {f['wow_pct']:+.2f}%, actual avg {f['actual_avg']}"
+                )
+            cross_metric_block = (
+                "\nOTHER FLAGGED METRICS (use for cross-metric hypotheses):\n"
+                + "\n".join(lines)
+            )
+
     prompt = f"""You are a senior business analyst at an Indian e-commerce company.
 
 METRIC UNDER REVIEW: {metric}
 
-ACTUALS (last 7 days):
-{actuals_week}
+ACTUALS (last 28 days — 4-week trend):
+{actuals_4w}
 
 FORECAST (last 7 days):
 {forecast_week}
 
 SEASONALITY ASSUMPTIONS:
 {season_str}
+{stats_block}
+STATISTICAL CONTEXT:
+- 4-week mean: {mean_4w:.3f}  |  4-week std dev: {std_4w:.3f}
+- Current week avg vs 4-week mean: z-score = {z_score:.2f} ({pct_vs_4w_mean:+.1f}% deviation)
+{cross_metric_block}
 
 HYPOTHESES TO TEST:
 {hypotheses_text}
@@ -138,7 +180,11 @@ if __name__ == "__main__":
             HYPOTHESIS_LIBRARY[2],
         ]
 
-        verdict = check_hypotheses("sample_data.xlsx", metric, test_hypotheses)
+        verdict = check_hypotheses(
+            "sample_data.xlsx", metric, test_hypotheses,
+            variance_stats=flagged[0],
+            all_flagged=flagged,
+        )
         print(f"\n=== HYPOTHESIS VERDICTS FOR: {metric} ===")
         print(verdict)
     else:
